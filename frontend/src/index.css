@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+/* Semantic status colours used across the dashboard. Defining them once keeps
+   "healthy / degraded / down" visually consistent in every component. */
+@theme {
+  --color-ok: oklch(0.66 0.15 155);
+  --color-warn: oklch(0.78 0.15 80);
+  --color-crit: oklch(0.62 0.21 25);
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
