@@ -31,6 +31,25 @@ class Settings(BaseSettings):
     # --- health checks ---
     health_check_timeout_s: float = Field(default=2.0, gt=0, le=30)
 
+    # --- simulation / worker ---
+    sim_seed: int = 42
+    sim_tick_seconds: int = Field(default=5, ge=1, le=60)
+    sim_backfill_minutes: int = Field(default=60, ge=0, le=24 * 60)
+    telemetry_retention_hours: int = Field(default=24, ge=1, le=24 * 30)
+    # Fault injection endpoints exist for demos and tests; they are never mounted
+    # in production regardless of this flag.
+    simulation_control_enabled: bool = True
+    worker_metrics_port: int = Field(default=9100, ge=1024, le=65535)
+
+    @property
+    def snapshot_ttl_s(self) -> int:
+        """A service whose latest snapshot is older than three ticks is "unknown"."""
+        return self.sim_tick_seconds * 3
+
+    @property
+    def simulation_control_mounted(self) -> bool:
+        return self.simulation_control_enabled and self.environment != "production"
+
     # --- AI agent (used from Milestone 4) ---
     anthropic_api_key: SecretStr | None = None
     anthropic_model: str = "claude-sonnet-5-5"
@@ -47,6 +66,15 @@ class Settings(BaseSettings):
             v = "postgresql+asyncpg://" + v.split("://", 1)[1]
         if not v.startswith("postgresql+asyncpg://"):
             raise ValueError("DATABASE_URL must be a PostgreSQL URL (postgresql+asyncpg://...)")
+        return v
+
+    @field_validator("sim_tick_seconds")
+    @classmethod
+    def _tick_divides_a_minute(cls, v: int) -> int:
+        # Ticks are scheduled on wall-clock seconds (0, 5, 10, ...), so the
+        # interval has to divide 60 to stay evenly spaced across minutes.
+        if 60 % v:
+            raise ValueError("SIM_TICK_SECONDS must divide 60 (e.g. 1, 2, 5, 10, 15, 30)")
         return v
 
     @field_validator("redis_url")

@@ -1,4 +1,9 @@
-import type { ApiErrorBody, ReadinessResponse } from "./types";
+import type {
+  ApiErrorBody,
+  FleetOverview,
+  ReadinessResponse,
+  SimulationStatus,
+} from "./types";
 
 const API_BASE = "/api/v1";
 
@@ -50,4 +55,8 @@ export const api = {
   // 503 is an expected answer from readiness ("degraded"), not a failure to fetch.
   readiness: (signal?: AbortSignal) =>
     request<ReadinessResponse>("/health/ready", { signal, acceptStatuses: [503] }),
+  fleet: (signal?: AbortSignal) => request<FleetOverview>("/services", { signal }),
+  // 404 when simulation control isn't mounted (production); treated as "no simulator".
+  simulation: (signal?: AbortSignal) =>
+    request<SimulationStatus>("/simulation/status", { signal }),
 };

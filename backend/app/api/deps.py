@@ -3,6 +3,7 @@ so tests can override any of them with ``app.dependency_overrides``."""
 
 from collections.abc import AsyncIterator
 
+from arq.connections import ArqRedis
 from fastapi import Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -23,6 +24,11 @@ def get_engine(request: Request) -> AsyncEngine:
 def get_redis(request: Request) -> "Redis":
     redis: Redis = request.app.state.redis
     return redis
+
+
+def get_arq(request: Request) -> ArqRedis:
+    arq: ArqRedis = request.app.state.arq
+    return arq
 
 
 async def get_db(request: Request) -> AsyncIterator[AsyncSession]:

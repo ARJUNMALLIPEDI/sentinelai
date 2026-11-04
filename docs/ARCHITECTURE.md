@@ -51,7 +51,7 @@ Two non-functional requirements shape almost every decision:
 └───────▲────────┘            └────────▲────────┘             │    Grafana     │
         │                              │ consume jobs          └────────────────┘
 ┌───────┴──────────────────────────────┴──────────────────────────────────────┐
-│                         "worker" process  (planned, M2+)                     │
+│                         "worker" process  (arq)                             │
 │  simulation.engine  ─ tick ─►  metrics + logs  ─►  Postgres / Redis          │
 │  monitoring.collector ─► detection.detectors ─► incidents.service           │
 │  agent.orchestrator  ◄─ "investigate incident" job                          │
@@ -71,7 +71,7 @@ about. The alternative — FastAPI `BackgroundTasks` or an in-process
 `asyncio` loop — is simpler but loses jobs on restart, can't scale
 independently, and couples a slow LLM loop to the API's event loop.
 
-### Why arq instead of Celery? *(planned)*
+### Why arq instead of Celery?
 
 The whole backend is `async` (FastAPI, SQLAlchemy async, the Anthropic SDK's
 async client). **arq** is an asyncio-native Redis job queue, so worker code is
@@ -117,28 +117,35 @@ enforceable and tests deterministic.
 backend/app/
 ├── main.py              # app factory + lifespan (wiring only)
 ├── core/                # config, logging, errors — imported by everyone, imports nothing app-level
-├── db/                  # engine/session, declarative Base
+├── domain/              # dependency-free enums shared by every layer
+├── db/                  # engine/session, declarative Base, column type helpers
 ├── models/              # SQLAlchemy tables
 ├── schemas/             # Pydantic request/response models
-├── api/                 # routers + dependencies (thin: parse → call service → serialise)
-├── observability/       # Prometheus metrics + middleware
-├── services/            # business logic (incidents, reports)              (M3+)
-├── simulation/          # simulated services, failure injection           (M2)
-├── monitoring/          # metric collection loop                           (M3)
-├── detection/           # detector interface + threshold/statistical impls (M3)
-├── logs/                # log ingestion + query                            (M2)
-├── agent/               # orchestrator, tool registry, prompts, report schema (M4)
-├── remediation/         # recommendations, approval state machine, executor (M5)
-└── worker.py            # arq worker entrypoint                            (M2)
+├── repositories/        # data access: catalog, telemetry (queries live here, not in routes)
+├── api/                 # routers + dependencies (thin: parse → call repo/domain → serialise)
+├── observability/       # Prometheus metrics + middleware for the API itself
+├── simulation/          # pure fleet simulator: topology, faults, engine        (M2)
+├── monitoring/          # health evaluation, Redis snapshot cache               (M2)
+├── logs/                # log ingestion (single entry path for all logs)        (M2)
+├── worker/              # arq jobs: tick, backfill, faults, retention           (M2)
+├── detection/           # detector interface + threshold/statistical impls     (M3)
+├── agent/               # orchestrator, tool registry, prompts, report schema   (M4)
+└── remediation/         # recommendations, approval state machine, executor     (M5)
 ```
+
+The business-logic layer is named `repositories/` (data access) plus pure
+modules (`monitoring/health.py`, later `detection/`) rather than `services/`,
+because "service" already means a microservice in the fleet, and
+`services/service_service.py` helps nobody.
 
 **Dependency direction** (enforced by convention, checked in review):
 
 ```
-api ─► services ─► models/db
-agent ─► agent.tools ─► services (read-only methods)
-remediation.executor ─► simulation (the ONLY module allowed to mutate sim state)
-core ◄─ everything
+api ─► repositories ─► models/db
+api ─► monitoring (pure)        worker ─► simulation + repositories + logs
+agent ─► agent.tools ─► repositories (read-only functions)
+remediation.executor ─► worker jobs ─► simulation (the ONLY path that mutates the fleet)
+core, domain ◄─ everything
 ```
 
 The agent package never imports `remediation.executor` or `simulation`
@@ -147,14 +154,16 @@ expression of "the AI can never execute an action."
 
 ---
 
-## 5. Data model (initial sketch)
+## 5. Data model
 
 ```
-services ──< service_instances
-   │
-   ├──< metric_samples (service_id, ts, cpu, mem, latency_p95, rps, error_rate, db_conns, …)
-   ├──< log_entries    (service_id, ts, level, message, attrs JSONB, incident_id?)
-   └──< deployments    (service_id, version, ts, status)
+services (kind, tier, SLOs, current_version) ──< service_dependencies >── services
+   │                                               (calls_per_request, criticality, is_async)
+   ├──< metric_samples (service_id, ts) UNIQUE — one wide row per service per tick
+   ├──< log_entries    (service_id, ts, level, message, instance, trace_id, attributes JSONB)
+   └──< deployments    (service_id, version, previous_version, kind, initiated_by, deployed_at)
+
+--- planned ---
 
 incidents (status, severity, detected_by, fingerprint) ──< incident_events (append-only timeline)
    ├──< investigations (status, started_at, model, tool_calls, tokens) ──< agent_steps
@@ -164,7 +173,19 @@ incidents (status, severity, detected_by, fingerprint) ──< incident_events (
 audit_log (actor, action, entity, entity_id, payload JSONB, ts) — append-only
 ```
 
-Milestone 1 ships only `services` to prove the migration pipeline end-to-end.
+Shipped so far: everything above the `planned` line (M1: `services`; M2: the
+rest). Instance-level rows are deliberately absent — instance counts live on
+each metric sample, which is all health and investigation need.
+
+**Wide vs narrow metrics.** `metric_samples` has a typed column per signal
+rather than `(service, metric_name, value)` rows. The signal set is fixed, a
+"latest snapshot" is one row, and there are ~14× fewer rows. The cost is a
+migration to add a signal. `UNIQUE (service_id, ts)` doubles as the index for
+"one service over a window" and makes inserts idempotent (retried ticks and
+overlapping backfills become no-ops).
+
+**Log pagination** is a keyset cursor on `(ts, id)`, not `id` alone: a
+backfill inserts *new* ids with *old* timestamps, so id order is not time order.
 
 Enums are stored as `VARCHAR + CHECK` (`native_enum=False`), not Postgres
 `ENUM` types. **Tradeoff:** we lose a little type strictness at the DB level,
@@ -173,7 +194,81 @@ but adding a value to a native Postgres enum requires a non-transactional
 
 ---
 
-## 6. Agent design (preview of M4)
+## 6. The simulated fleet (M2)
+
+Eight services: `api-gateway`, `auth`, `orders`, `inventory`, `payments`,
+`notification` (async consumer), `postgres-primary`, `redis-cache`.
+
+```
+api-gateway ─┬─► auth-service ─────────┬─► redis-cache
+             ├─► orders-service ─┬─────┼─► postgres-primary
+             │                   ├─► payments-service ─► postgres-primary
+             │                   ├─► inventory-service ─┬─► postgres-primary
+             │                   └┄► notification (async)└─► redis-cache
+             └─► inventory-service
+```
+
+The engine (`app/simulation/engine.py`) is pure and deterministic per seed.
+Each tick:
+
+1. **Traffic flows callers-first.** Only edge services get external traffic
+   (with a daily cycle); everyone else gets callers' *admitted* traffic ×
+   calls-per-request. An upstream outage removes downstream load.
+2. **Latency uses M/M/1 queueing**, `R = S / (1 − ρ)`: flat at low
+   utilisation, steep near saturation. Sync dependency latency is added.
+3. **Connection pools use Little's law**: in use = rate × hold time. Slow
+   queries lengthen hold time, so a slow DB appears as pool exhaustion in the
+   *callers* — the classic "the DB looks fine but every service is timing out"
+   incident.
+4. **Errors propagate by criticality**: a cache failure barely hurts auth (it
+   falls back to the DB); an inventory outage fails ~90% of orders but only
+   ~50% of gateway traffic; a notification outage fails nothing (async).
+5. **Noise is AR(1)**, so series are autocorrelated like real metrics.
+
+**Faults change one service's local behaviour; everything else emerges.** A
+DB connection leak is injected into `orders-service` alone; gateway errors
+and the 503 logs in its callers are consequences, not scripted. If faults
+edited upstream metrics directly, the root cause would be baked into the data
+and the M4 agent would have nothing real to reason about.
+
+**A bad deploy looks routine.** `latency_regression` records an ordinary
+`ci-pipeline` deployment — routine deploys happen too (~4/day/service) — so
+the agent has to correlate deploy time with the latency change, not read a
+label. Clearing it records a rollback.
+
+**Logs are rendered from the same tick's metrics**, so "pool active=60/60" in
+a log line equals that tick's `db_conn_active/db_conn_max` (a unit test
+enforces this). Evidence sources never contradict each other.
+
+### Worker
+
+`arq` runs a cron tick every `SIM_TICK_SECONDS` plus queued jobs (fault
+inject/clear, retention). Engine calls are synchronous, so interleaving jobs
+can't observe half-updated state. Each tick: persist samples/logs/deploys →
+write per-service snapshots to Redis (TTL = 3 ticks) → heartbeat → gauges.
+
+- **One replica only.** The fleet lives in the worker's memory; a second
+  replica would be a second, divergent fleet. Restarting resets faults and
+  backfills the gap (bounded by `SIM_BACKFILL_MINUTES`).
+- **Snapshots expire.** If the worker dies, health becomes `unknown` within
+  three ticks — the dashboard can't show a frozen "all healthy".
+- **The API never touches the engine.** It validates fault requests (so bad
+  ones get a synchronous 422/409) and enqueues a job whose id is the fault id,
+  so a retried request can't enqueue twice. Simulation control is not mounted
+  in production.
+
+### Health vs detection
+
+`monitoring/health.py` compares the latest sample with fixed objectives
+(p95 and error-rate SLOs per service, CPU/memory/pool ceilings) and returns
+`healthy | degraded | down | unknown` with human-readable reasons. That is
+*not* anomaly detection (M3), which compares a signal with its own history and
+can fire while a service is still within SLO — e.g. the pool climbing from 15
+to 38 during a leak is "healthy" but clearly abnormal.
+
+---
+
+## 7. Agent design (preview of M4)
 
 - **Orchestrator loop:** `messages.create(tools=…)` → for each `tool_use`
   block, validate input with the tool's Pydantic model → execute against
@@ -194,12 +289,11 @@ but adding a value to a native Postgres enum requires a non-transactional
 
 ---
 
-## 7. Engineering challenges we expect
+## 8. Engineering challenges
 
-1. **Realistic, correlated failures.** Independent random noise per metric is
-   unconvincing. The simulator needs a dependency graph (api-gateway →
-   orders → postgres) so a DB pool exhaustion shows up as upstream latency
-   and errors. Failures are injected scenarios with seeds for reproducibility.
+1. **Realistic, correlated failures.** *(Addressed in M2, §6.)* Faults are
+   local; propagation comes from the dependency graph, queueing and pool
+   models, and runs are reproducible by seed.
 2. **Alert storms and dedup.** One failure trips many detectors across many
    services. Anomalies are fingerprinted (service + signal + window) and
    merged into an open incident under a Redis lock instead of creating one
@@ -212,7 +306,8 @@ but adding a value to a native Postgres enum requires a non-transactional
 5. **Approval safety.** Remediation transitions are a strict state machine
    with optimistic locking so a double-click can't execute twice; the executor
    re-validates the action against current state at execution time.
-6. **Time-series growth.** `metric_samples` grows fast. Start with a
-   `(service_id, ts)` index and a retention job; partition by day later.
+6. **Time-series growth.** ~140k metric rows/day at 5 s ticks. M2 has the
+   `(service_id, ts)` index and a 15-minute retention job (24 h default);
+   daily partitions (drop a partition instead of `DELETE`) come when needed.
 7. **Testing async code against real infrastructure.** Integration tests run
    against real Postgres/Redis; each test gets a clean schema.

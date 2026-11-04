@@ -12,8 +12,9 @@ pytestmark = pytest.mark.integration
 
 async def test_liveness_does_not_touch_dependencies(client_factory: Callable[..., Any]) -> None:
     # Point both dependencies at closed ports: liveness must still be 200.
-    broken = make_settings(database_url="postgresql://x:x@127.0.0.1:1/x",
-                           redis_url="redis://127.0.0.1:1/0")
+    broken = make_settings(
+        database_url="postgresql://x:x@127.0.0.1:1/x", redis_url="redis://127.0.0.1:1/0"
+    )
     async with client_factory(broken) as client:
         r = await client.get("/api/v1/health/live")
     assert r.status_code == 200
@@ -65,7 +66,8 @@ async def test_metrics_use_route_templates_not_raw_paths(client: AsyncClient) ->
 
 
 async def test_metrics_collapse_path_params_into_one_series(
-    settings: Any, client_factory: Callable[..., Any],
+    settings: Any,
+    client_factory: Callable[..., Any],
 ) -> None:
     from fastapi import APIRouter
 
@@ -87,7 +89,8 @@ async def test_metrics_collapse_path_params_into_one_series(
 
 
 async def test_unhandled_exception_returns_json_500_with_request_id(
-    settings: Any, client_factory: Callable[..., Any],
+    settings: Any,
+    client_factory: Callable[..., Any],
 ) -> None:
     def add_failing_route(app: FastAPI) -> None:
         async def boom() -> None:
@@ -100,8 +103,11 @@ async def test_unhandled_exception_returns_json_500_with_request_id(
     assert r.status_code == 500
     assert r.headers["x-request-id"] == "trace-500"
     err = r.json()["error"]
-    assert err == {"code": "internal_error", "message": "An unexpected error occurred.",
-                   "request_id": "trace-500"}
+    assert err == {
+        "code": "internal_error",
+        "message": "An unexpected error occurred.",
+        "request_id": "trace-500",
+    }
     assert "hunter2" not in r.text
 
 

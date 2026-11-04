@@ -1,7 +1,7 @@
 # Local development stack.  `docker compose up --build`
 #
 # Startup order is enforced with health checks, not sleeps:
-#   postgres, redis (healthy) -> migrate (runs once, must exit 0) -> api -> frontend
+#   postgres, redis (healthy) -> migrate (runs once, must exit 0) -> api, worker -> frontend
 #
 # Migrations run in a dedicated one-shot service rather than in the API's
 # entrypoint: with several API replicas, "migrate on boot" makes every replica
@@ -17,6 +17,10 @@ x-backend-env: &backend-env
   CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:5173"]}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
+  SIM_SEED: ${SIM_SEED:-42}
+  SIM_TICK_SECONDS: ${SIM_TICK_SECONDS:-5}
+  SIM_BACKFILL_MINUTES: ${SIM_BACKFILL_MINUTES:-60}
+  TELEMETRY_RETENTION_HOURS: ${TELEMETRY_RETENTION_HOURS:-24}
 
 services:
   postgres:
@@ -69,6 +73,25 @@ services:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
 
+  # Runs the simulation and background jobs. Exactly one replica: the simulated
+  # fleet lives in this process's memory (see app/worker/jobs.py).
+  worker:
+    build: ./backend
+    command: ["arq", "--watch", "app", "app.worker.settings.WorkerSettings"]
+    environment: *backend-env
+    volumes: ["./backend:/app"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    # The image's default healthcheck probes the API port; the worker serves
+    # only its Prometheus endpoint, so check that instead.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/metrics', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+
   frontend:
     build: ./frontend
     environment:
@@ -84,7 +107,7 @@ services:
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports: ["${PROMETHEUS_PORT:-9090}:9090"]
-    depends_on: [api]
+    depends_on: [api, worker]
 
   grafana:
     image: grafana/grafana:11.3.0

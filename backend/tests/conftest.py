@@ -1,13 +1,20 @@
 import os
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import Settings
 from app.main import create_app
+from app.worker.jobs import WorkerState, build_state, close_state
 
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL", "postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel_test"
@@ -29,9 +36,54 @@ def make_settings(**overrides: Any) -> Settings:
     return Settings(_env_file=None, **values)  # type: ignore[call-arg]
 
 
+BACKEND = Path(__file__).resolve().parents[1]
+TELEMETRY_TABLES = (
+    "log_entries",
+    "metric_samples",
+    "deployments",
+    "service_dependencies",
+    "services",
+)
+
+
+def alembic_config() -> Config:
+    cfg = Config(str(BACKEND / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND / "alembic"))
+    cfg.attributes["database_url"] = TEST_DATABASE_URL
+    cfg.attributes["configure_logger"] = False
+    return cfg
+
+
+@pytest.fixture(scope="session")
+def migrated_db() -> None:
+    """Bring the test database to the latest schema once per session."""
+    command.upgrade(alembic_config(), "head")
+
+
+@pytest.fixture
+async def clean_db(migrated_db: None) -> AsyncIterator[None]:
+    """Empty tables and the test Redis DB so every test starts from nothing."""
+    engine = create_async_engine(TEST_DATABASE_URL)
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {', '.join(TELEMETRY_TABLES)} RESTART IDENTITY CASCADE"))
+    await engine.dispose()
+    redis = Redis.from_url(TEST_REDIS_URL)
+    await redis.flushdb()
+    await redis.aclose()
+    yield
+
+
 @pytest.fixture
 def settings() -> Settings:
-    return make_settings()
+    return make_settings(sim_backfill_minutes=10, sim_seed=7)
+
+
+@pytest.fixture
+async def worker(settings: Settings, clean_db: None) -> AsyncIterator[WorkerState]:
+    """A worker that has seeded the catalog and backfilled ``sim_backfill_minutes``."""
+    state = await build_state(settings)
+    yield state
+    await close_state(state)
 
 
 @pytest.fixture

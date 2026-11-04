@@ -12,12 +12,13 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from arq.connections import ArqRedis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from redis.asyncio import Redis
+from redis.asyncio import ConnectionPool, Redis
 
 from app import __version__
-from app.api.router import api_router
+from app.api.router import build_api_router
 from app.core.config import Settings, get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import configure_logging
@@ -43,11 +44,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             decode_responses=True,
             socket_connect_timeout=settings.health_check_timeout_s,
         )
-        logger.info("startup", extra={"ctx": {"environment": settings.environment,
-                                               "version": __version__}})
+        # Job queue client for handing work to the worker. A connection pool
+        # connects lazily, so the API still starts while Redis is unavailable.
+        app.state.arq = ArqRedis(ConnectionPool.from_url(settings.redis_url))
+        logger.info(
+            "startup", extra={"ctx": {"environment": settings.environment, "version": __version__}}
+        )
         try:
             yield
         finally:
+            await app.state.arq.aclose()
             await app.state.redis.aclose()
             await engine.dispose()
             logger.info("shutdown")
@@ -72,6 +78,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(RequestContextMiddleware)
     install_error_handlers(app)
 
-    app.include_router(api_router, prefix=settings.api_prefix)
+    app.include_router(
+        build_api_router(settings.simulation_control_mounted), prefix=settings.api_prefix
+    )
     app.include_router(metrics_router)
     return app

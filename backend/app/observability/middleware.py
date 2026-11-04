@@ -90,23 +90,29 @@ class RequestContextMiddleware:
                 HTTP_LATENCY.labels(scope["method"], route).observe(elapsed)
                 logger.info(
                     "request",
-                    extra={"ctx": {
-                        "method": scope["method"],
-                        "path": scope["path"],
-                        "route": route,
-                        "status": status_code,
-                        "duration_ms": round(elapsed * 1000, 2),
-                    }},
+                    extra={
+                        "ctx": {
+                            "method": scope["method"],
+                            "path": scope["path"],
+                            "route": route,
+                            "status": status_code,
+                            "duration_ms": round(elapsed * 1000, 2),
+                        }
+                    },
                 )
             request_id_ctx.reset(token)
 
     @staticmethod
     async def _send_500(send: Send) -> None:
         body = json.dumps(error_body("internal_error", "An unexpected error occurred.")).encode()
-        await send({
-            "type": "http.response.start",
-            "status": 500,
-            "headers": [(b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode())],
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 500,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
         await send({"type": "http.response.body", "body": body})

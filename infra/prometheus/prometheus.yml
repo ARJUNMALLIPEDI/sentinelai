@@ -7,4 +7,8 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["api:8000"]
-  # Milestone 2 adds a job for the worker / simulated-fleet exporter.
+  # Worker: tick timing plus the simulated fleet's gauges (sentinel_sim_*).
+  - job_name: sentinel-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["worker:9100"]

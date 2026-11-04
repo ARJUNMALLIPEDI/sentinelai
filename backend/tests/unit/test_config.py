@@ -14,7 +14,9 @@ def test_heroku_style_postgres_scheme_is_accepted() -> None:
     assert s.database_url.startswith("postgresql+asyncpg://")
 
 
-@pytest.mark.parametrize("url", ["mysql://u:p@db/x", "sqlite:///x.db", "postgresql+psycopg2://u@db/x"])
+@pytest.mark.parametrize(
+    "url", ["mysql://u:p@db/x", "sqlite:///x.db", "postgresql+psycopg2://u@db/x"]
+)
 def test_non_asyncpg_database_urls_are_rejected(url: str) -> None:
     with pytest.raises(ValidationError, match="DATABASE_URL"):
         make_settings(database_url=url)
