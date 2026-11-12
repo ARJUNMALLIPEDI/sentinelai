@@ -31,6 +31,11 @@ def make_settings(**overrides: Any) -> Settings:
         "log_json": False,
         "log_level": "WARNING",
         "health_check_timeout_s": 1.0,
+        # Settings also read environment variables. Inside the Docker stack the real
+        # ANTHROPIC_API_KEY is set, so tests must clear it explicitly: no test may ever
+        # see (or spend) a real key. Tests that need "a key" pass a fake one.
+        "anthropic_api_key": None,
+        "agent_auto_investigate": False,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[call-arg]
