@@ -75,3 +75,24 @@ export interface SimulationStatus {
   tick_seconds: number;
   active_faults: ActiveFault[];
 }
+
+export type IncidentSeverity = "sev1" | "sev2" | "sev3" | "sev4";
+export type IncidentStatus = "open" | "acknowledged" | "investigating" | "mitigated" | "resolved";
+
+export interface IncidentSummary {
+  id: string;
+  number: number;
+  ref: string;
+  title: string;
+  status: IncidentStatus;
+  severity: IncidentSeverity;
+  detected_by: string;
+  opened_at: string;
+  last_activity_at: string;
+  acknowledged_at: string | null;
+  mitigated_at: string | null;
+  resolved_at: string | null;
+  signals_cleared_at: string | null;
+  services: string[];
+  active_anomalies: number;
+}

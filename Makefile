@@ -2,7 +2,7 @@
 -include .env
 API_PORT ?= 8000
 
-.PHONY: up down logs logs-worker test test-unit lint migrate migration fe-check fault
+.PHONY: up down logs logs-worker test test-unit lint migrate migration fe-check fault evaluate
 
 up:            ## Build and start the full stack
 	docker compose up --build -d
@@ -38,3 +38,6 @@ fault:         ## Inject a fault: make fault svc=orders-service type=db_connecti
 	curl -s -X POST http://localhost:$(API_PORT)/api/v1/simulation/faults \
 	  -H 'content-type: application/json' \
 	  -d '{"service":"$(svc)","type":"$(type)"}'; echo
+
+evaluate:      ## Detection quality report (false positives, time-to-detect) over 3 seeds
+	docker compose exec api python -m app.detection.evaluate --seeds 1 2 3

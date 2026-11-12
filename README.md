@@ -5,7 +5,7 @@ fleet, detects anomalies, has a Claude tool-using agent investigate incidents
 against real (simulated) evidence, and proposes remediations that only run
 after a human approves them.
 
-> **Status:** Milestone 2 of 7 — simulated infrastructure. See [Roadmap](#roadmap).
+> **Status:** Milestone 3 of 7 — anomaly detection and incidents. See [Roadmap](#roadmap).
 
 Design rationale, data model and the agent safety boundary are in
 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
@@ -55,7 +55,10 @@ make fault svc=orders-service type=db_connection_leak # a local slow-burn incide
 make fault svc=orders-service type=latency_regression # a "routine" deploy that isn't
 ```
 
-Then watch the dashboard. `GET /api/v1/simulation/fault-types` lists every
+Then watch the dashboard: within seconds detection opens an incident
+(Active incidents panel), groups the cascade into it and links the evidence
+logs. Clear the fault and it records recovery, then auto-resolves after 10
+quiet minutes if nobody acknowledged it. `GET /api/v1/simulation/fault-types` lists every
 scenario and which services it applies to; `GET /api/v1/simulation/status`
 shows active faults (each has an id you can `DELETE /api/v1/simulation/faults/{id}`).
 
@@ -75,7 +78,7 @@ make fe-check      # frontend type-check + production build
 
 ---
 
-## API (Milestone 2)
+## API
 
 | Endpoint | Purpose |
 |---|---|
@@ -86,9 +89,35 @@ make fe-check      # frontend type-check + production build
 | `GET /api/v1/logs?service=&level=&q=&minutes=&cursor=` | Log search, newest first, keyset-paginated |
 | `POST /api/v1/logs/batch` | Log ingestion; partial acceptance with per-record rejections |
 | `GET /api/v1/deployments?service=&hours=` | Deployment and rollback history |
+| `GET /api/v1/incidents?active=true&severity=` | Incidents with services and active-anomaly counts |
+| `GET /api/v1/incidents/{ref}` | Detail by `INC-12`, `12` or UUID: anomalies + timeline |
+| `POST /api/v1/incidents` | Open an incident manually |
+| `PATCH /api/v1/incidents/{ref}` | Status (state machine), severity, note — row-locked |
+| `POST /api/v1/incidents/{ref}/notes` | Timeline note |
+| `GET /api/v1/incidents/{ref}/logs` | Evidence logs linked by detection |
+| `GET /api/v1/anomalies?status=active` | Anomalies across incidents |
 | `/api/v1/simulation/*` | Fault injection and simulator status (not mounted in production) |
 
 Full schema at `/docs`.
+
+---
+
+## Detection quality
+
+`make evaluate` (or `python -m app.detection.evaluate --seeds 1 2 3`) replays
+the simulator through the production detectors and prints false positives,
+time-to-detect, grouping and recovery for every scenario. Current results
+(seeds 1–3, 24 fault-free hours):
+
+| Scenario | Time to detect | Incidents per fault | Early warning |
+|---|---|---|---|
+| Service outage | 0 s | 1 | — |
+| Slow queries, bad deploy, error burst, CPU, cache | 5–10 s | 1 | — |
+| DB connection leak | 20–25 s | 1 | 60–70 s before pool breach |
+| Memory leak | 85–115 s | 1 | 4.4–5.5 min before first OOM kill |
+| **No fault (24 h)** | — | **0 false positives** | |
+
+Measured on the simulator; real telemetry is noisier. See ARCHITECTURE.md §7.
 
 ---
 
@@ -142,6 +171,7 @@ All configuration is via environment variables, validated at startup by
 | `SIM_TICK_SECONDS` | no | `5` | Must divide 60 |
 | `SIM_BACKFILL_MINUTES` | no | `60` | History generated on worker start (gap only) |
 | `TELEMETRY_RETENTION_HOURS` | no | `24` | Older metrics and logs are pruned every 15 min |
+| `INCIDENT_AUTO_RESOLVE_MINUTES` | no | `10` | Untouched incidents auto-resolve after this much quiet |
 | `SIMULATION_CONTROL_ENABLED` | no | `true` | Fault-injection API; never mounted when `ENVIRONMENT=production` |
 | `GRAFANA_ADMIN_PASSWORD` | Compose | — | |
 
@@ -162,7 +192,8 @@ sentinelai/
 │   │   ├── simulation/        # pure fleet simulator: topology, faults, engine
 │   │   ├── monitoring/        # health evaluation, Redis snapshot cache
 │   │   ├── logs/              # log ingestion
-│   │   ├── worker/            # arq jobs: tick, backfill, faults, retention
+│   │   ├── detection/         # detectors, correlation planner, evaluation harness
+│   │   ├── worker/            # arq jobs: tick, detect, backfill, faults, retention
 │   │   └── observability/     # Prometheus metrics, request-context middleware
 │   ├── alembic/               # migrations
 │   └── tests/{unit,integration}/
@@ -175,7 +206,7 @@ sentinelai/
 └── docker-compose.yml
 ```
 
-Packages for detection, the agent and remediation are added in their
+Packages for the agent and remediation are added in their
 milestones (see ARCHITECTURE.md §4). How the simulator models traffic,
 queueing, connection pools and failure propagation is in ARCHITECTURE.md §6.
 
@@ -187,7 +218,8 @@ queueing, connection pools and failure propagation is in ARCHITECTURE.md §6.
       health/readiness, Prometheus metrics, Alembic, Compose, dashboard shell
 - [x] **M2 — Infrastructure simulation:** 8-service dependency graph, metrics, logs, deployments,
       8 failure scenarios, health evaluation, arq worker, fleet dashboard
-- [ ] **M3 — Monitoring & anomaly detection:** threshold + statistical detectors, incident dedup
+- [x] **M3 — Monitoring & anomaly detection:** threshold + robust z-score detectors, topology-aware
+      correlation, incident lifecycle and timeline, evidence linking, evaluation harness
 - [ ] **M4 — AI investigation agent:** Claude tool use, bounded loop, grounded reports
 - [ ] **M5 — Remediation:** approval state machine, simulated execution, audit log
 - [ ] **M6 — Dashboard:** metrics charts, incidents, investigations, approvals

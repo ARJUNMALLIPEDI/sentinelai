@@ -134,10 +134,16 @@ async def list_deployments(
 
 
 async def prune_before(session: AsyncSession, cutoff: datetime) -> dict[str, int]:
-    """Delete telemetry older than ``cutoff``. Deployments are kept: they're tiny
-    and an investigation may need to look back further than the metrics window."""
-    counts = {}
-    for name, model in (("metric_samples", MetricSample), ("log_entries", LogEntry)):
-        result = await session.execute(delete(model).where(model.ts < cutoff))
-        counts[name] = result.rowcount or 0  # type: ignore[attr-defined]
-    return counts
+    """Delete telemetry older than ``cutoff``.
+
+    Kept regardless of age: deployments (tiny, and investigations look back
+    further than the metrics window) and logs linked to an incident (evidence).
+    """
+    samples = await session.execute(delete(MetricSample).where(MetricSample.ts < cutoff))
+    logs = await session.execute(
+        delete(LogEntry).where(LogEntry.ts < cutoff, LogEntry.incident_id.is_(None))
+    )
+    return {
+        "metric_samples": samples.rowcount or 0,  # type: ignore[attr-defined]
+        "log_entries": logs.rowcount or 0,  # type: ignore[attr-defined]
+    }

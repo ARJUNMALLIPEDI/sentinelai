@@ -127,8 +127,8 @@ backend/app/
 ├── simulation/          # pure fleet simulator: topology, faults, engine        (M2)
 ├── monitoring/          # health evaluation, Redis snapshot cache               (M2)
 ├── logs/                # log ingestion (single entry path for all logs)        (M2)
-├── worker/              # arq jobs: tick, backfill, faults, retention           (M2)
-├── detection/           # detector interface + threshold/statistical impls     (M3)
+├── detection/           # detectors, correlation planner, evaluation harness   (M3)
+├── worker/              # arq jobs: tick, detect, backfill, faults, retention  (M2/M3)
 ├── agent/               # orchestrator, tool registry, prompts, report schema   (M4)
 └── remediation/         # recommendations, approval state machine, executor     (M5)
 ```
@@ -142,7 +142,7 @@ because "service" already means a microservice in the fleet, and
 
 ```
 api ─► repositories ─► models/db
-api ─► monitoring (pure)        worker ─► simulation + repositories + logs
+api ─► monitoring (pure)        worker ─► simulation + detection + repositories + logs
 agent ─► agent.tools ─► repositories (read-only functions)
 remediation.executor ─► worker jobs ─► simulation (the ONLY path that mutates the fleet)
 core, domain ◄─ everything
@@ -163,9 +163,16 @@ services (kind, tier, SLOs, current_version) ──< service_dependencies >─�
    ├──< log_entries    (service_id, ts, level, message, instance, trace_id, attributes JSONB)
    └──< deployments    (service_id, version, previous_version, kind, initiated_by, deployed_at)
 
+incidents (number → INC-n, status, severity, signals_cleared_at, last_activity_at)
+   ├──< incident_services >── services
+   ├──< anomalies (service, signal, detector, status, value/peak/baseline/threshold/score)
+   │       UNIQUE (service_id, signal, detector) WHERE status = 'active'
+   ├──< incident_events  — append-only timeline (kind, actor, message, data JSONB)
+   └──< log_entries.incident_id — evidence; exempt from retention
+
 --- planned ---
 
-incidents (status, severity, detected_by, fingerprint) ──< incident_events (append-only timeline)
+incidents
    ├──< investigations (status, started_at, model, tool_calls, tokens) ──< agent_steps
    ├──< incident_reports (JSONB validated by Pydantic report schema)
    └──< remediations (action, params, status: proposed→approved|rejected→executing→succeeded|failed)
@@ -173,8 +180,8 @@ incidents (status, severity, detected_by, fingerprint) ──< incident_events (
 audit_log (actor, action, entity, entity_id, payload JSONB, ts) — append-only
 ```
 
-Shipped so far: everything above the `planned` line (M1: `services`; M2: the
-rest). Instance-level rows are deliberately absent — instance counts live on
+Shipped so far: everything above the `planned` line (M1: `services`; M2:
+telemetry; M3: incidents). Instance-level rows are deliberately absent — instance counts live on
 each metric sample, which is all health and investigation need.
 
 **Wide vs narrow metrics.** `metric_samples` has a typed column per signal
@@ -268,7 +275,75 @@ to 38 during a leak is "healthy" but clearly abnormal.
 
 ---
 
-## 7. Agent design (preview of M4)
+## 7. Detection and incidents (M3)
+
+```
+worker cron (every tick, +2 s)
+  └─ one transaction, pg_try_advisory_xact_lock
+       load ~30 min of metric_samples  →  detectors (pure)  →  findings
+       load active anomalies + open incidents
+       plan(findings, state, topology)  (pure)  →  Plan
+       apply Plan (insert/update + timeline events)  →  link evidence logs
+```
+
+**Two detectors, one interface.** `Detector.detect(series, policy) → [Finding]`.
+
+* *Threshold* — objectives and capacity limits with a Prometheus-style
+  `for:` duration (3 samples for SLOs; 4 for lost instances so a rolling
+  deploy's 2-tick restart never pages; 1 for "no healthy instances").
+* *Robust z-score* — `(x − median) / (1.4826·MAD)` over a 30-minute baseline,
+  confirmed on 3 consecutive samples, gated by direction plus minimum
+  absolute/relative change. Median/MAD rather than mean/σ so an earlier spike
+  in the window can't inflate the spread and mask the next anomaly (a unit test
+  pins this). Its value is *early warning*: it flags a connection leak about a
+  minute, and a memory leak about five, before any objective is breached.
+
+**Correlation is a pure planner** (`detection/correlation.py`). Anomalies are
+keyed `(service, signal, detector)` and refreshed, not duplicated. New
+findings are grouped into connected components of the dependency graph over
+currently-anomalous services and attached to an open incident touching the
+component or its neighbours (if active in the last 10 minutes), else open one.
+Severity = worst `anomaly severity × service tier` and only escalates
+automatically. Anomalies resolve after 30 s of quiet (hysteresis). When an
+incident's signals all recover, an untouched (`open`) incident auto-resolves
+after `INCIDENT_AUTO_RESOLVE_MINUTES`; once anyone engages, they own closure.
+
+*Known limitation:* topology grouping over-merges through hubs. Two unrelated
+faults that both reach `postgres-primary` land in one incident (reproducible:
+error burst on payments + cache degradation). Separating them needs reasoning
+over evidence, which is the M4 agent's job.
+
+**Concurrency, defended at three levels.** arq's `unique` cron prevents
+overlapping runs in one worker; an advisory lock skips a cycle that races
+another process; and a partial unique index makes a duplicate *active* anomaly
+impossible even if both fail. Status changes from the API take a row lock
+(`SELECT … FOR UPDATE`). The detector's own writes are compare-and-set
+(`UPDATE … WHERE status = 'open'`, `WHERE severity > :new`), so it can never
+resolve an incident someone just acknowledged or lower a severity a human set.
+
+**One plan, two executors.** `InMemoryStore` (evaluation, tests) and the
+Postgres executor apply the same `Plan`. An integration test feeds identical
+samples through both and requires identical results, so the evaluation numbers
+describe what production actually does.
+
+**Evaluation** (`python -m app.detection.evaluate`): 0 false positives across
+24 simulated fault-free hours (3 seeds, peak and trough, about two dozen routine deploys);
+every scenario detected (outage 0 s, most 5–10 s, connection leak 20–25 s,
+memory leak 85–115 s), grouped into exactly one incident, recovered and
+auto-resolved. A trimmed version runs in the unit suite as a regression guard.
+
+**Evidence outlives telemetry.** WARNING+ logs from an incident's services
+(from 2 minutes before it opened) are linked to it and exempt from retention.
+
+**Incident status machine** (`domain/incidents.py`):
+`open → acknowledged → investigating → mitigated → resolved`, forward skips
+allowed, `mitigated → investigating` (a mitigation can fail), `resolved → open`
+(reopen). Resolving closes the incident's still-active anomalies; if the
+problem persists, the next cycle opens a *new* incident.
+
+---
+
+## 8. Agent design (preview of M4)
 
 - **Orchestrator loop:** `messages.create(tools=…)` → for each `tool_use`
   block, validate input with the tool's Pydantic model → execute against
@@ -289,18 +364,16 @@ to 38 during a leak is "healthy" but clearly abnormal.
 
 ---
 
-## 8. Engineering challenges
+## 9. Engineering challenges
 
 1. **Realistic, correlated failures.** *(Addressed in M2, §6.)* Faults are
    local; propagation comes from the dependency graph, queueing and pool
    models, and runs are reproducible by seed.
-2. **Alert storms and dedup.** One failure trips many detectors across many
-   services. Anomalies are fingerprinted (service + signal + window) and
-   merged into an open incident under a Redis lock instead of creating one
-   incident each.
-3. **Statistical detection without false positives.** Rolling z-score / EWMA
-   need warm-up windows and minimum-duration rules; we'll test them against
-   recorded synthetic series with known anomalies.
+2. **Alert storms and dedup.** *(Addressed in M3, §7.)* Keyed anomalies,
+   topology-aware grouping, advisory lock + partial unique index.
+3. **Statistical detection without false positives.** *(Addressed in M3, §7.)*
+   Robust baseline, warm-up, confirmation, direction and minimum-change
+   guards — measured, not assumed, by the evaluation harness.
 4. **LLM grounding and cost.** Bounded loops, evidence IDs, schema validation
    with a retry-on-invalid-output step, token accounting.
 5. **Approval safety.** Remediation transitions are a strict state machine

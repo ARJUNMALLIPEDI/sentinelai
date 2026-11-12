@@ -1,6 +1,7 @@
 import type {
   ApiErrorBody,
   FleetOverview,
+  IncidentSummary,
   ReadinessResponse,
   SimulationStatus,
 } from "./types";
@@ -57,6 +58,8 @@ export const api = {
     request<ReadinessResponse>("/health/ready", { signal, acceptStatuses: [503] }),
   fleet: (signal?: AbortSignal) => request<FleetOverview>("/services", { signal }),
   // 404 when simulation control isn't mounted (production); treated as "no simulator".
+  activeIncidents: (signal?: AbortSignal) =>
+    request<IncidentSummary[]>("/incidents?active=true&limit=20", { signal }),
   simulation: (signal?: AbortSignal) =>
     request<SimulationStatus>("/simulation/status", { signal }),
 };

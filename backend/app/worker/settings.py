@@ -12,6 +12,7 @@ from app.core.config import get_settings
 from app.worker import jobs
 
 _settings = get_settings()
+_DETECT_OFFSET = min(2, _settings.sim_tick_seconds - 1)
 
 
 class WorkerSettings:
@@ -23,6 +24,13 @@ class WorkerSettings:
         cron(
             jobs.tick,
             second=set(range(0, 60, _settings.sim_tick_seconds)),
+            unique=True,
+            timeout=_settings.sim_tick_seconds * 2,
+        ),
+        # Detection runs once per tick, offset so it sees the tick that just landed.
+        cron(
+            jobs.detect,
+            second={(s + _DETECT_OFFSET) % 60 for s in range(0, 60, _settings.sim_tick_seconds)},
             unique=True,
             timeout=_settings.sim_tick_seconds * 2,
         ),

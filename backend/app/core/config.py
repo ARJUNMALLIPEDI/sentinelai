@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     simulation_control_enabled: bool = True
     worker_metrics_port: int = Field(default=9100, ge=1024, le=65535)
 
+    # --- detection / incidents ---
+    # An untouched incident whose signals have been normal this long is resolved
+    # automatically. Acknowledged incidents are never auto-resolved.
+    incident_auto_resolve_minutes: int = Field(default=10, ge=1, le=24 * 60)
+
     @property
     def snapshot_ttl_s(self) -> int:
         """A service whose latest snapshot is older than three ticks is "unknown"."""

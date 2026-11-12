@@ -31,3 +31,55 @@ class LogLevel(StrEnum):
 class DeploymentKind(StrEnum):
     DEPLOY = "deploy"
     ROLLBACK = "rollback"
+
+
+class AnomalySeverity(StrEnum):
+    MINOR = "minor"  # statistically unusual, still within objectives
+    MAJOR = "major"  # objective breached (SLO, capacity)
+    CRITICAL = "critical"  # service down or most requests failing
+
+
+class AnomalyStatus(StrEnum):
+    ACTIVE = "active"
+    RESOLVED = "resolved"
+
+
+class IncidentSeverity(StrEnum):
+    """SEV1 is the worst. Ordered so that min() over values gives the most severe."""
+
+    SEV1 = "sev1"
+    SEV2 = "sev2"
+    SEV3 = "sev3"
+    SEV4 = "sev4"
+
+
+class IncidentStatus(StrEnum):
+    OPEN = "open"
+    ACKNOWLEDGED = "acknowledged"
+    INVESTIGATING = "investigating"
+    MITIGATED = "mitigated"
+    RESOLVED = "resolved"
+
+
+class IncidentEventKind(StrEnum):
+    OPENED = "opened"
+    ANOMALY_DETECTED = "anomaly_detected"
+    ANOMALY_RESOLVED = "anomaly_resolved"
+    SEVERITY_CHANGED = "severity_changed"
+    STATUS_CHANGED = "status_changed"
+    SIGNALS_RECOVERED = "signals_recovered"
+    SIGNALS_REGRESSED = "signals_regressed"
+    NOTE = "note"
+
+
+class Signal(StrEnum):
+    """Signals detection evaluates (derived ones: pool utilization, availability)."""
+
+    LATENCY_P95 = "latency_p95_ms"
+    ERROR_RATE = "error_rate"
+    CPU = "cpu_pct"
+    MEMORY = "memory_pct"
+    RPS = "rps"
+    DB_POOL = "db_pool_utilization"
+    CACHE_HIT = "cache_hit_rate"
+    AVAILABILITY = "availability"

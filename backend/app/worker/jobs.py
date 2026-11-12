@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.session import build_engine, build_sessionmaker
+from app.detection.correlation import CorrelationConfig
 from app.domain.enums import DeploymentKind, LogLevel
 from app.logs.ingest import ingest_logs
 from app.monitoring.snapshots import FAULTS_KEY, HEARTBEAT_KEY, write_snapshots
@@ -39,6 +40,7 @@ from app.schemas.telemetry import LogIn, MetricSnapshot
 from app.simulation.engine import SimulationEngine, TickResult
 from app.simulation.faults import FaultType, InvalidFaultError
 from app.simulation.topology import FLEET
+from app.worker.detection import run_detection
 
 logger = logging.getLogger("sentinel.worker")
 
@@ -275,6 +277,24 @@ async def clear_fault(
     await publish_faults(state)
     logger.info("fault_cleared", extra={"ctx": {"fault_id": fault_id, "actor": actor}})
     return {"ok": True, "fault": fault.as_dict()}
+
+
+async def detect(ctx: dict[str, Any]) -> dict[str, int]:
+    state: WorkerState = ctx["state"]
+    config = CorrelationConfig(
+        auto_resolve_after=timedelta(minutes=state.settings.incident_auto_resolve_minutes)
+    )
+    async with state.sessionmaker() as session, session.begin():
+        outcome = await run_detection(session, state.settings.sim_tick_seconds, config)
+    p = outcome.plan
+    if p is None:
+        return {"ran": 0}
+    return {
+        "ran": 1,
+        "new_incidents": len(p.new_incidents),
+        "new_anomalies": len(p.new_anomalies),
+        "resolved_anomalies": len(p.resolved),
+    }
 
 
 async def prune(ctx: dict[str, Any]) -> dict[str, int]:

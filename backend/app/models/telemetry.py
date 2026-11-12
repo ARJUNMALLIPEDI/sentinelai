@@ -86,6 +86,11 @@ class LogEntry(Base):
     attributes: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
+    # Set when the log becomes evidence for an incident. Linked logs are exempt
+    # from retention, so an incident's evidence outlives the telemetry window.
+    incident_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("incidents.id", ondelete="SET NULL"), index=True
+    )
 
 
 class Deployment(Base):
