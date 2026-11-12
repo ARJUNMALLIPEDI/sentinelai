@@ -55,9 +55,24 @@ class Settings(BaseSettings):
     def simulation_control_mounted(self) -> bool:
         return self.simulation_control_enabled and self.environment != "production"
 
-    # --- AI agent (used from Milestone 4) ---
+    # --- AI agent ---
     anthropic_api_key: SecretStr | None = None
     anthropic_model: str = "claude-sonnet-5-5"
+    # The docs recommend "medium" for multistep tool use on Sonnet 5.5.
+    agent_effort: Literal["low", "medium", "high"] = "medium"
+    agent_max_tool_calls: int = Field(default=20, ge=1, le=100)
+    agent_max_turns: int = Field(default=14, ge=2, le=50)
+    agent_timeout_s: float = Field(default=300, ge=10, le=1800)
+    agent_request_timeout_s: float = Field(default=120, ge=5, le=600)
+    agent_max_retries: int = Field(default=3, ge=0, le=10)
+    # Off by default: every investigation costs API tokens. When on, new SEV1/SEV2
+    # incidents are investigated automatically.
+    agent_auto_investigate: bool = False
+
+    @property
+    def agent_configured(self) -> bool:
+        key = self.anthropic_api_key
+        return key is not None and bool(key.get_secret_value().strip())
 
     @field_validator("database_url")
     @classmethod

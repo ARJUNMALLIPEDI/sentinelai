@@ -7,15 +7,21 @@ from app.domain.enums import (
     IncidentEventKind,
     IncidentSeverity,
     IncidentStatus,
+    InvestigationStatus,
     LogLevel,
     ServiceKind,
     ServiceTier,
 )
 from app.models.incident import Anomaly, Incident, IncidentEvent, IncidentService
+from app.models.investigation import AgentStep, IncidentReportRecord, Investigation
 from app.models.service import Service, ServiceDependency
 from app.models.telemetry import Deployment, LogEntry, MetricSample
 
 __all__ = [
+    "AgentStep",
+    "IncidentReportRecord",
+    "Investigation",
+    "InvestigationStatus",
     "Anomaly",
     "AnomalySeverity",
     "AnomalyStatus",

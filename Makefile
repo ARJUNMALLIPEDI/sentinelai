@@ -2,7 +2,7 @@
 -include .env
 API_PORT ?= 8000
 
-.PHONY: up down logs logs-worker test test-unit lint migrate migration fe-check fault evaluate
+.PHONY: up down logs logs-worker test test-unit lint migrate migration fe-check fault evaluate investigate
 
 up:            ## Build and start the full stack
 	docker compose up --build -d
@@ -41,3 +41,6 @@ fault:         ## Inject a fault: make fault svc=orders-service type=db_connecti
 
 evaluate:      ## Detection quality report (false positives, time-to-detect) over 3 seeds
 	docker compose exec api python -m app.detection.evaluate --seeds 1 2 3
+
+investigate:   ## Run an AI investigation and watch it: make investigate inc=INC-1
+	docker compose exec api python -m app.agent.cli $(inc)

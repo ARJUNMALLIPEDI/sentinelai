@@ -5,7 +5,7 @@ fleet, detects anomalies, has a Claude tool-using agent investigate incidents
 against real (simulated) evidence, and proposes remediations that only run
 after a human approves them.
 
-> **Status:** Milestone 3 of 7 — anomaly detection and incidents. See [Roadmap](#roadmap).
+> **Status:** Milestone 4 of 7 — AI incident investigation. See [Roadmap](#roadmap).
 
 Design rationale, data model and the agent safety boundary are in
 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
@@ -18,7 +18,7 @@ Design rationale, data model and the agent safety boundary are in
 |---|---|
 | API | Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2 (async) + asyncpg, Alembic |
 | Data | PostgreSQL 16 (system of record), Redis 7 (queue, cache, locks) |
-| AI | Anthropic Claude API with native tool use *(Milestone 4)* |
+| AI | Anthropic Claude API (Sonnet 5.5): strict tool use, adaptive thinking, prompt caching |
 | Observability | Prometheus, Grafana, structured JSON logs with request IDs |
 | Frontend | React 19, TypeScript, Tailwind CSS v4, Vite, Recharts *(Milestone 6)* |
 | Tests | Pytest, pytest-asyncio, httpx — integration tests use real Postgres/Redis |
@@ -96,9 +96,35 @@ make fe-check      # frontend type-check + production build
 | `POST /api/v1/incidents/{ref}/notes` | Timeline note |
 | `GET /api/v1/incidents/{ref}/logs` | Evidence logs linked by detection |
 | `GET /api/v1/anomalies?status=active` | Anomalies across incidents |
+| `POST /api/v1/incidents/{ref}/investigations` | Queue an AI investigation (409 if one is running, 503 without an API key) |
+| `GET /api/v1/investigations/{id}` | Investigation with every model and tool step |
+| `GET /api/v1/incidents/{ref}/report` | Latest report (complete or partial) |
 | `/api/v1/simulation/*` | Fault injection and simulator status (not mounted in production) |
 
 Full schema at `/docs`.
+
+---
+
+## AI investigation
+
+Needs `ANTHROPIC_API_KEY` in `.env` (restart the stack after adding it).
+
+```bash
+make fault svc=orders-service type=db_connection_leak
+make investigate inc=INC-1
+```
+
+`make investigate` runs the agent in your terminal and prints each model turn
+and tool call (with its evidence ID) as it happens, then the report: summary,
+root cause with status and confidence, confirmed findings vs hypotheses, and
+recommended remediations. The same investigation is available through the API
+(`POST /api/v1/incidents/INC-1/investigations`, then
+`GET /api/v1/incidents/INC-1/report`) and on the incident timeline.
+
+The agent can only read. It has seven read-only tools; remediations it
+recommends are data in the report and are executed only after human approval
+(Milestone 5). The CLI prints the number of model and tool calls, tokens used
+and an estimated cost for each run.
 
 ---
 
@@ -165,8 +191,11 @@ All configuration is via environment variables, validated at startup by
 | `LOG_LEVEL` | no | `INFO` | |
 | `LOG_JSON` | no | `true` | `false` for human-readable local logs |
 | `CORS_ORIGINS` | no | `["http://localhost:5173"]` | JSON list |
-| `ANTHROPIC_API_KEY` | from M4 | — | Stored as `SecretStr`; never logged |
+| `ANTHROPIC_API_KEY` | for investigations | — | Stored as `SecretStr`; never logged |
 | `ANTHROPIC_MODEL` | no | `claude-sonnet-5-5` | |
+| `AGENT_EFFORT` | no | `medium` | `low` / `medium` / `high` |
+| `AGENT_MAX_TOOL_CALLS` | no | `20` | Hard budget per investigation |
+| `AGENT_AUTO_INVESTIGATE` | no | `false` | Investigate new SEV1/SEV2 incidents automatically |
 | `SIM_SEED` | no | `42` | Same seed → same simulated world |
 | `SIM_TICK_SECONDS` | no | `5` | Must divide 60 |
 | `SIM_BACKFILL_MINUTES` | no | `60` | History generated on worker start (gap only) |
@@ -193,6 +222,7 @@ sentinelai/
 │   │   ├── monitoring/        # health evaluation, Redis snapshot cache
 │   │   ├── logs/              # log ingestion
 │   │   ├── detection/         # detectors, correlation planner, evaluation harness
+│   │   ├── agent/             # tools, report schema, orchestrator loop, CLI
 │   │   ├── worker/            # arq jobs: tick, detect, backfill, faults, retention
 │   │   └── observability/     # Prometheus metrics, request-context middleware
 │   ├── alembic/               # migrations
@@ -206,7 +236,7 @@ sentinelai/
 └── docker-compose.yml
 ```
 
-Packages for the agent and remediation are added in their
+The remediation package is added in their
 milestones (see ARCHITECTURE.md §4). How the simulator models traffic,
 queueing, connection pools and failure propagation is in ARCHITECTURE.md §6.
 
@@ -220,7 +250,8 @@ queueing, connection pools and failure propagation is in ARCHITECTURE.md §6.
       8 failure scenarios, health evaluation, arq worker, fleet dashboard
 - [x] **M3 — Monitoring & anomaly detection:** threshold + robust z-score detectors, topology-aware
       correlation, incident lifecycle and timeline, evidence linking, evaluation harness
-- [ ] **M4 — AI investigation agent:** Claude tool use, bounded loop, grounded reports
+- [x] **M4 — AI investigation agent:** 7 read-only tools, bounded loop, evidence-grounded reports,
+      full audit trail, CLI + API
 - [ ] **M5 — Remediation:** approval state machine, simulated execution, audit log
 - [ ] **M6 — Dashboard:** metrics charts, incidents, investigations, approvals
 - [ ] **M7 — Hardening:** failure-mode tests, performance, production images, deployment

@@ -1,6 +1,14 @@
 from fastapi import APIRouter
 
-from app.api.routes import deployments, health, incidents, logs, services, simulation
+from app.api.routes import (
+    deployments,
+    health,
+    incidents,
+    investigations,
+    logs,
+    services,
+    simulation,
+)
 
 
 def build_api_router(include_simulation_control: bool) -> APIRouter:
@@ -10,6 +18,7 @@ def build_api_router(include_simulation_control: bool) -> APIRouter:
     router.include_router(logs.router)
     router.include_router(deployments.router)
     router.include_router(incidents.router)
+    router.include_router(investigations.router)
     if include_simulation_control:
         router.include_router(simulation.router)
     return router

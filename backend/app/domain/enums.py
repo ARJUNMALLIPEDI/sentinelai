@@ -70,6 +70,9 @@ class IncidentEventKind(StrEnum):
     SIGNALS_RECOVERED = "signals_recovered"
     SIGNALS_REGRESSED = "signals_regressed"
     NOTE = "note"
+    INVESTIGATION_STARTED = "investigation_started"
+    INVESTIGATION_COMPLETED = "investigation_completed"
+    INVESTIGATION_FAILED = "investigation_failed"
 
 
 class Signal(StrEnum):
@@ -83,3 +86,11 @@ class Signal(StrEnum):
     DB_POOL = "db_pool_utilization"
     CACHE_HIT = "cache_hit_rate"
     AVAILABILITY = "availability"
+
+
+class InvestigationStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"  # a validated report was produced
+    INCOMPLETE = "incomplete"  # a budget ran out; a partial report was stored
+    FAILED = "failed"  # the model or the platform errored

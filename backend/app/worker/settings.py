@@ -5,7 +5,7 @@ time, which requires the environment to be configured. Tests import ``jobs``
 directly and never touch this module.
 """
 
-from arq import cron
+from arq import cron, func
 from arq.connections import RedisSettings
 
 from app.core.config import get_settings
@@ -17,7 +17,12 @@ _DETECT_OFFSET = min(2, _settings.sim_tick_seconds - 1)
 
 class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(_settings.redis_url)
-    functions = [jobs.inject_fault, jobs.clear_fault]
+    functions = [
+        jobs.inject_fault,
+        jobs.clear_fault,
+        # The agent enforces its own wall-clock budget; arq's timeout is the backstop.
+        func(jobs.investigate, timeout=_settings.agent_timeout_s + 60, max_tries=1),
+    ]
     cron_jobs = [
         # unique=True: if a tick overruns its interval, the next one is skipped
         # rather than run concurrently.

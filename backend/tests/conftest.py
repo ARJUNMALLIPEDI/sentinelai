@@ -38,6 +38,9 @@ def make_settings(**overrides: Any) -> Settings:
 
 BACKEND = Path(__file__).resolve().parents[1]
 TELEMETRY_TABLES = (
+    "agent_steps",
+    "incident_reports",
+    "investigations",
     "incident_events",
     "anomalies",
     "incident_services",

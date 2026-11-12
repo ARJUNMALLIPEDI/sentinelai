@@ -168,20 +168,19 @@ incidents (number → INC-n, status, severity, signals_cleared_at, last_activity
    ├──< anomalies (service, signal, detector, status, value/peak/baseline/threshold/score)
    │       UNIQUE (service_id, signal, detector) WHERE status = 'active'
    ├──< incident_events  — append-only timeline (kind, actor, message, data JSONB)
-   └──< log_entries.incident_id — evidence; exempt from retention
+   ├──< log_entries.incident_id — evidence; exempt from retention
+   ├──< investigations (status, model, effort, tokens, cost)
+   │       ONE active per incident (partial unique index)  ──< agent_steps (audit trail)
+   └──< incident_reports (report JSONB, partial, root-cause status)
 
 --- planned ---
-
-incidents
-   ├──< investigations (status, started_at, model, tool_calls, tokens) ──< agent_steps
-   ├──< incident_reports (JSONB validated by Pydantic report schema)
-   └──< remediations (action, params, status: proposed→approved|rejected→executing→succeeded|failed)
+incidents ──< remediations (action, params, status: proposed→approved|rejected→executing→succeeded|failed)
 
 audit_log (actor, action, entity, entity_id, payload JSONB, ts) — append-only
 ```
 
-Shipped so far: everything above the `planned` line (M1: `services`; M2:
-telemetry; M3: incidents). Instance-level rows are deliberately absent — instance counts live on
+Shipped so far: everything above the last `planned` line (M1: `services`;
+M2: telemetry; M3: incidents; M4: investigations). Instance-level rows are deliberately absent — instance counts live on
 each metric sample, which is all health and investigation need.
 
 **Wide vs narrow metrics.** `metric_samples` has a typed column per signal
@@ -343,24 +342,72 @@ problem persists, the next cycle opens a *new* incident.
 
 ---
 
-## 8. Agent design (preview of M4)
+## 8. Investigation agent (M4)
 
-- **Orchestrator loop:** `messages.create(tools=…)` → for each `tool_use`
-  block, validate input with the tool's Pydantic model → execute against
-  read-only services with a per-tool timeout → return `tool_result` → repeat
-  until the model calls `generate_incident_report` or limits trip.
-- **Limits:** max tool calls, max wall-clock, max tokens per investigation;
-  hitting a limit produces a partial report marked as such, never a silent
-  failure.
-- **Grounding:** every tool result gets an `evidence_id`. The final report
-  schema requires findings to cite evidence IDs; the orchestrator rejects
-  reports that cite IDs it never issued, and separates `confirmed_findings`
-  from `hypotheses`.
-- **Persistence:** every step (prompt, tool input, tool output summary,
-  tokens, latency) is written to `agent_steps` for audit and replay.
-- **Testing:** the Claude client sits behind an interface, so integration
-  tests drive the orchestrator with scripted model responses — no API key
-  needed in CI.
+```
+POST /incidents/INC-1/investigations ─► investigations row (queued) ─► arq job
+  investigate: claim (queued→running, CAS) ─► incident → investigating
+    brief (anomalies, timeline, topology) ─► orchestrator loop:
+      Claude ─► tool_use ─► validate ─► read-only tool (timeout) ─► tool_result + E-id
+        └─ ... ─► generate_incident_report ─► schema + grounding checks
+    persist: agent_steps (every call), incident_reports, timeline event
+```
+
+**Model and API settings** (Claude Sonnet 5.5): adaptive thinking,
+`output_config.effort = "medium"` (the documented starting point for
+multistep tool use), `strict: true` tools, and automatic prompt caching (the
+system prompt, tools and conversation prefix are re-read at the cache rate on
+every turn).
+
+**Tools are typed, read-only and anchored.** Seven tools: metrics, logs,
+health and topology, DB connections, deployments, related incidents/anomalies,
+plus the terminal `generate_incident_report`. Each input schema is generated
+from the Pydantic model that re-validates it, cleaned for strict mode (closed
+objects, no length/range keywords), with service names pinned to an `enum` of
+real services. Outputs are summaries (baselines, top log patterns, 12-point
+series), not raw dumps. "Now" is the incident's anchor time, so re-running an
+investigation later still examines the incident.
+
+**Grounding is enforced, not requested.** Every successful tool result gets
+an evidence ID. The report schema requires evidence on findings, metrics, log
+excerpts and remediations; the orchestrator rejects reports that cite IDs it
+never issued, name non-existent services, or call a root cause "confirmed"
+without evidence or with low confidence. Rejections go back as `is_error` tool
+results listing the problems and the valid IDs, so the model corrects itself
+(up to 3 attempts).
+
+**The loop is bounded and protocol-correct.**
+
+| Limit / rule | Behaviour |
+|---|---|
+| Tool calls (20), turns (14), wall clock (300 s), report attempts (3) | ends `incomplete` with a partial report of evidence gathered |
+| Tool timeout (15 s), tool exception, invalid input, unknown tool | `is_error` result; the investigation continues |
+| `end_turn` without a report | one nudge, then `incomplete` |
+| `max_tokens` mid tool call | error result for each cut `tool_use`, one nudge |
+| `refusal`, API failure after SDK retries | `failed`, recorded on the timeline |
+| Assistant turns | echoed verbatim (thinking signatures included) |
+| Forced `tool_choice` | not used: rejected with adaptive thinking on Sonnet 5.5 |
+
+**Safety boundary.** The agent package cannot import the simulator, the worker
+or remediation code (a unit test parses its imports), and its tool registry is
+pinned to the seven read tools plus the report. Log text is untrusted input:
+the system prompt and the logs tool both say it is data, never instructions.
+Since `POST /logs/batch` accepts arbitrary text, prompt injection via logs is
+a real vector; its blast radius is limited to a misleading report, because the
+agent has no way to act.
+
+**Lifecycle.** A partial unique index allows one queued/running investigation
+per incident. Claiming is compare-and-set. Starting an investigation moves the
+incident to `investigating`, which also stops detection auto-resolving it.
+Every exception ends the row in a terminal state; on worker start,
+investigations older than the time budget are marked abandoned (newer ones may
+still be running from the CLI).
+
+**Testing without a key.** `LLMClient` is an interface; tests drive the real
+loop, real tools and real Postgres with a scripted model covering every path
+above. A mock HTTP transport checks the exact request the SDK sends (effort,
+thinking, caching, strict tools, no `tool_choice`) and the response parsing.
+Live runs use `make investigate inc=INC-n`.
 
 ---
 
@@ -374,8 +421,9 @@ problem persists, the next cycle opens a *new* incident.
 3. **Statistical detection without false positives.** *(Addressed in M3, §7.)*
    Robust baseline, warm-up, confirmation, direction and minimum-change
    guards — measured, not assumed, by the evaluation harness.
-4. **LLM grounding and cost.** Bounded loops, evidence IDs, schema validation
-   with a retry-on-invalid-output step, token accounting.
+4. **LLM grounding and cost.** *(Addressed in M4, §8.)* Bounded loop,
+   enforced evidence citations with self-correction, prompt caching, token
+   and cost accounting per investigation.
 5. **Approval safety.** Remediation transitions are a strict state machine
    with optimistic locking so a double-click can't execute twice; the executor
    re-validates the action against current state at execution time.

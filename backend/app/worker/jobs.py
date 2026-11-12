@@ -18,6 +18,7 @@ the fleet restarts healthy and the backfill fills the gap in history.
 import json
 import logging
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -27,14 +28,18 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.agent.llm import AnthropicLLM
+from app.agent.service import execute_investigation, fail_stale, request_investigation
 from app.core.config import Settings, get_settings
+from app.core.errors import ConflictError
 from app.core.logging import configure_logging
 from app.db.session import build_engine, build_sessionmaker
 from app.detection.correlation import CorrelationConfig
-from app.domain.enums import DeploymentKind, LogLevel
+from app.domain.enums import DeploymentKind, IncidentSeverity, LogLevel
 from app.logs.ingest import ingest_logs
 from app.monitoring.snapshots import FAULTS_KEY, HEARTBEAT_KEY, write_snapshots
 from app.repositories import catalog
+from app.repositories import incidents as incident_repo
 from app.repositories import telemetry as repo
 from app.schemas.telemetry import LogIn, MetricSnapshot
 from app.simulation.engine import SimulationEngine, TickResult
@@ -124,6 +129,9 @@ async def startup(ctx: dict[str, Any]) -> None:
     configure_logging(settings.log_level, settings.log_json)
     start_http_server(settings.worker_metrics_port)
     ctx["state"] = await build_state(settings)
+    abandoned = await fail_stale(ctx["state"].sessionmaker, settings.agent_timeout_s)
+    if abandoned:
+        logger.warning("investigations_abandoned", extra={"ctx": {"count": abandoned}})
     logger.info(
         "worker_started",
         extra={"ctx": {"tick_seconds": settings.sim_tick_seconds, "seed": settings.sim_seed}},
@@ -289,11 +297,63 @@ async def detect(ctx: dict[str, Any]) -> dict[str, int]:
     p = outcome.plan
     if p is None:
         return {"ran": 0}
+    if state.settings.agent_auto_investigate and state.settings.agent_configured:
+        serious = [
+            outcome.incident_ids[n.ref]
+            for n in p.new_incidents
+            if n.severity in (IncidentSeverity.SEV1, IncidentSeverity.SEV2)
+            and outcome.incident_ids
+            and n.ref in outcome.incident_ids
+        ]
+        for incident_id in serious:
+            await _auto_investigate(state, ctx["redis"], incident_id)
     return {
         "ran": 1,
         "new_incidents": len(p.new_incidents),
         "new_anomalies": len(p.new_anomalies),
         "resolved_anomalies": len(p.resolved),
+    }
+
+
+async def _auto_investigate(state: WorkerState, queue: Any, incident_id: Any) -> None:
+    async with state.sessionmaker() as s:
+        incident = await incident_repo.get_incident(s, str(incident_id))
+        if incident is None:
+            return
+        try:
+            inv = await request_investigation(
+                s, incident, trigger="auto", requested_by="detector", settings=state.settings
+            )
+        except ConflictError:
+            return
+        await s.commit()
+    await queue.enqueue_job("investigate", str(inv.id), _job_id=f"inv-{inv.id}")
+    logger.info("investigation_auto_queued", extra={"ctx": {"incident": incident.ref}})
+
+
+async def investigate(ctx: dict[str, Any], investigation_id: str) -> dict[str, Any]:
+    state: WorkerState = ctx["state"]
+    key = state.settings.anthropic_api_key
+    if not state.settings.agent_configured or key is None:
+        return {"ok": False, "error": "ANTHROPIC_API_KEY is not set"}
+    llm = AnthropicLLM(
+        key.get_secret_value(),
+        timeout_s=state.settings.agent_request_timeout_s,
+        max_retries=state.settings.agent_max_retries,
+    )
+    try:
+        outcome = await execute_investigation(
+            state.sessionmaker, uuid.UUID(investigation_id), llm, state.settings
+        )
+    finally:
+        await llm.close()
+    if outcome is None:
+        return {"ok": False, "error": "investigation was not queued"}
+    return {
+        "ok": outcome.status == "completed",
+        "status": outcome.status,
+        "tool_calls": outcome.tool_calls,
+        "llm_calls": outcome.llm_calls,
     }
 
 
